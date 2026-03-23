@@ -28,7 +28,7 @@ def add_exllamav3_to_path() -> None:
 
 
 def add_repo_to_path() -> None:
-    env_path = os.environ.get("RYS_REPRO_PATH") or os.environ.get("LEVELGEN_PATH")
+    env_path = os.environ.get("RYS_PATH") or os.environ.get("RYS_REPRO_PATH") or os.environ.get("LEVELGEN_PATH")
     if env_path and os.path.isdir(env_path):
         sys.path.insert(0, env_path)
         return

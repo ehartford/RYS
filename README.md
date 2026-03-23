@@ -1,4 +1,4 @@
-# RYS Repro
+# RYS
 
 Reproducibility framework for relayering experiments:
 

@@ -103,6 +103,7 @@ docker run "${RUN_FLAGS[@]}" \
   --gpus all \
   --ipc=host \
   -e EXLLAMAV3_PATH=/workspace/exllamav3 \
+  -e RYS_PATH=/workspace/repo \
   -e RYS_REPRO_PATH=/workspace/repo \
   -v "${REPO_ROOT}:/workspace/repo" \
   -v "${EXLLAMAV3_PATH}:/workspace/exllamav3" \
