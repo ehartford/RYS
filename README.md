@@ -137,6 +137,88 @@ This produces:
 - scatter plots
 - balanced Math+EQ heatmap artifacts
 
+## vLLM Kimi K2.6 Scanner
+
+The vLLM path is intended for large compressed-tensors checkpoints that should
+not be converted to EXL3. It monkey-patches vLLM's native DeepseekV2/DeepseekV3
+text forward loop at worker startup, then uses `collective_rpc` to set the
+current RYS execution order between configs.
+
+Run this as one tensor-parallel vLLM engine group across the available GPUs.
+vLLM may spawn multiple internal worker processes/ranks, but they are shards of
+one model replica. Do not launch multiple independent scan workers on the same
+8 GPUs unless another full Kimi replica can fit.
+
+For the local Kimi K2.6 setup:
+
+- environment: `source ~/RYS/.venv/bin/activate`
+- model: `~/models/Kimi-K2.6`
+- vLLM tree: `/home/hotaisle/vllm-rys`
+- expected vLLM version: `0.19.2rc1.dev66+gb47840019.d20260421`
+- text layers: `61`
+- known-good Kimi engine args: `--block-size 1 --reasoning-parser kimi_k2
+  --mm-encoder-tp-mode data`
+
+The first implementation uses `shared_cache` scan semantics: if a source layer
+is visited twice, both visits use the same physical vLLM attention module and
+KV cache slot. Use this for coarse search, then export and rescore top
+candidates in unmodified vLLM before treating a pattern as final.
+
+Create a coarse MoE-band queue:
+
+```bash
+python scripts/init_queue.py \
+  --num-layers 61 \
+  --min-i 1 \
+  --i-stride 2 \
+  --j-stride 2 \
+  --max-span 12 \
+  --queue-file results/kimi-k26/coarse_queue.json \
+  --results-file results/kimi-k26/coarse_combined_results.pkl
+```
+
+Run the vLLM combined worker:
+
+```bash
+python scripts/run_vllm_math_eq_combined_worker.py \
+  --queue-file results/kimi-k26/coarse_queue.json \
+  --combined-results-file results/kimi-k26/coarse_combined_results.pkl \
+  --math-results-file results/kimi-k26/coarse_math_results.pkl \
+  --eq-results-file results/kimi-k26/coarse_eq_results.pkl \
+  --model ~/models/Kimi-K2.6 \
+  --math-dataset-path datasets/math_16.json \
+  --eq-dataset-path datasets/eq_16.json \
+  --math-max-new 64 \
+  --eq-max-new 64 \
+  --tensor-parallel-size 8 \
+  --gpu-memory-utilization 0.90 \
+  --block-size 1 \
+  --reasoning-parser kimi_k2 \
+  --mm-encoder-tp-mode data
+```
+
+Analyze the resulting pickles with the existing analysis path:
+
+```bash
+python scripts/analyze_results.py \
+  --math-scores results/kimi-k26/coarse_math_results.pkl \
+  --eq-scores results/kimi-k26/coarse_eq_results.pkl \
+  --out-dir results/kimi-k26/analysis \
+  --num-layers 61 \
+  --title kimi-k26-vllm-shared-cache
+```
+
+For final confirmation, export top candidates and rescore the exported
+checkpoint in unmodified vLLM:
+
+```bash
+python -m hf_export.export_model \
+  --source ~/models/Kimi-K2.6 \
+  --output exports/kimi-k26-candidate \
+  --layer-list "0,1,2,3,3,4,..." \
+  --overwrite
+```
+
 ## Containerized ExLlama Run
 
 If you want a simple Docker entrypoint:
@@ -181,6 +263,26 @@ Notes:
 - beam search uses the Hugging Face worker path in `src/workers/`
 - seed pickles should come from an already measured single-block scan
 - state under `--work-dir` is resume-friendly
+
+For Kimi/vLLM candidate evaluation, add `--worker-backend vllm` and the vLLM
+parallelism settings. This routes each depth through the combined vLLM worker
+instead of loading separate HF Math and EQ workers:
+
+```bash
+uv run python scripts/beam_search.py \
+  --model-path ~/models/Kimi-K2.6 \
+  --num-layers 61 \
+  --seed-math-results results/kimi-k26/coarse_math_results.pkl \
+  --seed-eq-results results/kimi-k26/coarse_eq_results.pkl \
+  --math-dataset-path datasets/math_16.json \
+  --eq-dataset-path datasets/eq_16.json \
+  --work-dir results/kimi-k26/beam-search \
+  --worker-backend vllm \
+  --vllm-tensor-parallel-size 8 \
+  --vllm-block-size 1 \
+  --vllm-reasoning-parser kimi_k2 \
+  --vllm-mm-encoder-tp-mode data
+```
 
 ## Surrogate Pipeline
 

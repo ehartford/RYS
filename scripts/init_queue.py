@@ -118,6 +118,14 @@ def main():
                         help="Minimum duplicate span length (j - i).")
     parser.add_argument("--max-span", type=int, default=None,
                         help="Maximum duplicate span length (j - i).")
+    parser.add_argument("--min-i", type=int, default=None,
+                        help="Minimum block start i to include for generated legacy sweeps.")
+    parser.add_argument("--max-i", type=int, default=None,
+                        help="Maximum block start i to include for generated legacy sweeps.")
+    parser.add_argument("--i-stride", type=int, default=1,
+                        help="Keep only generated configs where i is on this stride.")
+    parser.add_argument("--j-stride", type=int, default=1,
+                        help="Keep only generated configs where j is on this stride.")
     parser.add_argument("--exclude-baseline", action="store_true",
                         help="Exclude baseline (0,0) from the queue.")
     parser.add_argument(
@@ -177,6 +185,33 @@ def main():
             layers_dict = generate_layer_dict(args.num_layers)
             print(f"Using full config space: {len(layers_dict)} configs")
 
+        if args.i_stride < 1 or args.j_stride < 1:
+            raise ValueError("--i-stride and --j-stride must be >= 1")
+
+        if (
+            args.min_i is not None
+            or args.max_i is not None
+            or args.i_stride != 1
+            or args.j_stride != 1
+        ):
+            def index_ok(key):
+                if key == (0, 0):
+                    return not args.exclude_baseline
+                i, j = key
+                if args.min_i is not None and i < args.min_i:
+                    return False
+                if args.max_i is not None and i > args.max_i:
+                    return False
+                i_origin = args.min_i if args.min_i is not None else 0
+                if (i - i_origin) % args.i_stride != 0:
+                    return False
+                if j % args.j_stride != 0:
+                    return False
+                return True
+
+            layers_dict = {k: v for k, v in layers_dict.items() if index_ok(k)}
+            print(f"After index/stride filter: {len(layers_dict)} configs")
+
         # Apply optional span filtering
         if args.min_span is not None or args.max_span is not None:
             def span_ok(key):
@@ -191,6 +226,10 @@ def main():
 
             layers_dict = {k: v for k, v in layers_dict.items() if span_ok(k)}
             print(f"After span filter: {len(layers_dict)} configs")
+
+        if args.exclude_baseline and (0, 0) in layers_dict:
+            layers_dict = {k: v for k, v in layers_dict.items() if k != (0, 0)}
+            print(f"After baseline exclusion: {len(layers_dict)} configs")
 
         all_config_keys = list(layers_dict.keys())
         for idx, key in enumerate(all_config_keys):

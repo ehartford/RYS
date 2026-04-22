@@ -12,6 +12,7 @@ from src.core.layer_config import normalize_to_layers
 
 
 TEXT_LAYER_PREFIX_CANDIDATES = (
+    "language_model.model.layers.",
     "model.language_model.layers.",
     "model.layers.",
     "language_model.layers.",

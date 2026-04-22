@@ -45,10 +45,13 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def copy_static_files(source_dir: Path, output_dir: Path) -> None:
+def copy_static_files(source_dir: Path, output_dir: Path, *, skip_files: set[str] | None = None) -> None:
+    skip_files = skip_files or set()
     output_dir.mkdir(parents=True, exist_ok=True)
     for item in source_dir.iterdir():
         if item.name == MODEL_INDEX_NAME:
+            continue
+        if item.name in skip_files:
             continue
         if item.name.startswith("model.safetensors-") and item.name.endswith(".safetensors"):
             continue
@@ -203,7 +206,7 @@ def main() -> None:
         spec_text=spec.spec_text,
         text_layer_prefix=spec.text_layer_prefix,
     )
-    copy_static_files(spec.source_dir, spec.output_dir)
+    copy_static_files(spec.source_dir, spec.output_dir, skip_files=set(source_weight_map.values()))
     save_json(spec.output_dir / "config.json", exported_config)
 
     manifest = build_manifest(

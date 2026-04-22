@@ -16,17 +16,28 @@ This script is resume-friendly: evaluated candidates are cached under --work-dir
 from __future__ import annotations
 
 import argparse
+import fcntl
 import json
 import pickle
+import re
 import statistics
 import subprocess
 import sys
+import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 ROOT = Path(__file__).resolve().parents[1]
+
+
+def enable_line_buffered_output() -> None:
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(line_buffering=True)
+        except Exception:
+            pass
 
 
 def expand_multi_block_config(num_layers: int, blocks: tuple[tuple[int, int], ...]) -> list[int]:
@@ -198,6 +209,43 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--local-files-only", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--trust-remote-code", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--skip-worker-preflight", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument(
+        "--worker-backend",
+        choices=["hf", "vllm"],
+        default="hf",
+        help="Worker backend for candidate evaluation.",
+    )
+    parser.add_argument("--vllm-tensor-parallel-size", type=int, default=1)
+    parser.add_argument("--vllm-gpu-memory-utilization", type=float, default=0.9)
+    parser.add_argument("--vllm-max-model-len", type=int, default=None)
+    parser.add_argument("--vllm-max-num-seqs", type=int, default=None)
+    parser.add_argument("--vllm-max-num-batched-tokens", type=int, default=None)
+    parser.add_argument("--vllm-block-size", type=int, default=None)
+    parser.add_argument("--vllm-reasoning-parser", default=None)
+    parser.add_argument("--vllm-mm-encoder-tp-mode", default=None)
+    parser.add_argument(
+        "--vllm-worker-extension-cls",
+        default="src.workers.vllm_worker_extension.RYSVllmWorkerExtension",
+    )
+    parser.add_argument("--vllm-enforce-eager", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument(
+        "--vllm-persistent-worker",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Keep one vLLM worker alive across beam depths instead of reloading the model per depth.",
+    )
+    parser.add_argument(
+        "--vllm-persistent-idle-timeout-sec",
+        type=float,
+        default=300.0,
+        help="How long a persistent vLLM worker may sit on an empty queue before exiting.",
+    )
+    parser.add_argument(
+        "--vllm-queue-poll-interval-sec",
+        type=float,
+        default=1.0,
+        help="Polling interval for persistent vLLM queue updates.",
+    )
 
     parser.add_argument("--python-bin", default=sys.executable)
     parser.add_argument("--dry-run", action="store_true", help="Prepare/print beam steps without worker eval.")
@@ -244,17 +292,60 @@ def _extract_score(raw: Any) -> float | None:
         return None
 
 
-def load_pair_score_map(path: Path) -> dict[tuple[int, int], float]:
+_LEGACY_PAIR_RE = re.compile(r"^\(?\s*(-?\d+)\s*,\s*(-?\d+)\s*\)?$")
+
+
+def _parse_legacy_pair_key(raw_key: Any) -> tuple[int, int] | None:
+    if isinstance(raw_key, (tuple, list)) and len(raw_key) == 2:
+        try:
+            return int(raw_key[0]), int(raw_key[1])
+        except Exception:
+            return None
+    if isinstance(raw_key, str):
+        match = _LEGACY_PAIR_RE.match(raw_key.strip())
+        if match:
+            return int(match.group(1)), int(match.group(2))
+    return None
+
+
+def _parse_layer_key(raw_key: Any) -> tuple[int, ...] | None:
+    if isinstance(raw_key, (tuple, list)):
+        try:
+            return tuple(int(x) for x in raw_key)
+        except Exception:
+            return None
+    if isinstance(raw_key, str):
+        raw = raw_key.strip()
+        if raw.lower().startswith("layers:"):
+            raw = raw.split(":", 1)[1].strip()
+            try:
+                return tuple(int(x.strip()) for x in raw.split(",") if x.strip())
+            except Exception:
+                return None
+    return None
+
+
+def build_single_block_layer_lookup(num_layers: int) -> dict[tuple[int, ...], tuple[int, int]]:
+    lookup: dict[tuple[int, ...], tuple[int, int]] = {tuple(range(num_layers)): (0, 0)}
+    for i in range(num_layers):
+        for j in range(i + 1, num_layers + 1):
+            lookup[tuple(expand_multi_block_config(num_layers, ((i, j),)))] = (i, j)
+    return lookup
+
+
+def load_pair_score_map(path: Path, *, num_layers: int | None = None) -> dict[tuple[int, int], float]:
     with path.open("rb") as f:
         data = pickle.load(f)
 
+    layer_lookup = build_single_block_layer_lookup(num_layers) if num_layers is not None else {}
     out: dict[tuple[int, int], float] = {}
     for k, v in data.items():
-        if not isinstance(k, (tuple, list)) or len(k) != 2:
-            continue
-        try:
-            key = (int(k[0]), int(k[1]))
-        except Exception:
+        key = _parse_legacy_pair_key(k)
+        if key is None and layer_lookup:
+            layer_key = _parse_layer_key(k)
+            if layer_key is not None:
+                key = layer_lookup.get(layer_key)
+        if key is None:
             continue
         score = _extract_score(v)
         if score is None:
@@ -705,6 +796,75 @@ def upsert_registry(
     registry[block_spec] = rec
 
 
+class StreamingProcess:
+    def __init__(self, *, cmd: list[str], cwd: Path, log_path: Path):
+        self.cmd = cmd
+        self.cwd = cwd
+        self.log_path = log_path
+        self.proc: subprocess.Popen[bytes] | None = None
+        self._log_f: Any = None
+        self._reader: threading.Thread | None = None
+
+    def start(self) -> None:
+        if self.proc is not None:
+            raise RuntimeError("StreamingProcess already started.")
+        self.log_path.parent.mkdir(parents=True, exist_ok=True)
+        self._log_f = self.log_path.open("ab")
+        header = f"\n[{time.strftime('%Y-%m-%d %H:%M:%S')}] CMD: {' '.join(self.cmd)}\n".encode()
+        self._log_f.write(header)
+        self._log_f.flush()
+        self.proc = subprocess.Popen(
+            self.cmd,
+            cwd=str(self.cwd),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            bufsize=0,
+        )
+        self._reader = threading.Thread(target=self._stream_output, daemon=True)
+        self._reader.start()
+
+    def _stream_output(self) -> None:
+        if self.proc is None or self.proc.stdout is None:
+            return
+        try:
+            while True:
+                chunk = self.proc.stdout.read(4096)
+                if not chunk:
+                    break
+                if self._log_f is not None:
+                    self._log_f.write(chunk)
+                    self._log_f.flush()
+                try:
+                    sys.stdout.buffer.write(chunk)
+                    sys.stdout.buffer.flush()
+                except Exception:
+                    sys.stdout.write(chunk.decode(errors="replace"))
+                    sys.stdout.flush()
+        finally:
+            if self._log_f is not None:
+                self._log_f.flush()
+
+    def poll(self) -> int | None:
+        if self.proc is None:
+            return None
+        return self.proc.poll()
+
+    def wait(self, timeout: float | None = None) -> int:
+        if self.proc is None:
+            return 0
+        rc = self.proc.wait(timeout=timeout)
+        if self._reader is not None:
+            self._reader.join(timeout=5)
+        if self._log_f is not None:
+            self._log_f.close()
+            self._log_f = None
+        return int(rc)
+
+    def terminate(self) -> None:
+        if self.proc is not None and self.proc.poll() is None:
+            self.proc.terminate()
+
+
 def run_worker(
     *,
     cmd: list[str],
@@ -716,13 +876,11 @@ def run_worker(
     if dry_run:
         return
 
-    log_path.parent.mkdir(parents=True, exist_ok=True)
-    with log_path.open("a", encoding="utf-8") as log_f:
-        log_f.write(f"\n[{time.strftime('%Y-%m-%d %H:%M:%S')}] CMD: {' '.join(cmd)}\n")
-        log_f.flush()
-        proc = subprocess.run(cmd, cwd=str(cwd), stdout=log_f, stderr=subprocess.STDOUT)
-    if proc.returncode != 0:
-        raise RuntimeError(f"Worker failed with code {proc.returncode}. See log: {log_path}")
+    proc = StreamingProcess(cmd=cmd, cwd=cwd, log_path=log_path)
+    proc.start()
+    rc = proc.wait()
+    if rc != 0:
+        raise RuntimeError(f"Worker failed with code {rc}. See log: {log_path}")
 
 
 def run_workers_parallel(
@@ -874,10 +1032,111 @@ def build_eq_worker_cmd(
     return cmd
 
 
+def build_vllm_combined_worker_cmd(
+    *,
+    args: argparse.Namespace,
+    config_file: Path | None,
+    queue_file: Path | None,
+    combined_results_file: Path,
+    math_results_file: Path,
+    eq_results_file: Path,
+    depth: int,
+    worker_suffix: str = "",
+    idle_timeout_sec: float | None = None,
+    queue_poll_interval_sec: float | None = None,
+    stop_file: Path | None = None,
+) -> list[str]:
+    if bool(config_file) == bool(queue_file):
+        raise ValueError("Exactly one of config_file or queue_file must be provided for vLLM worker.")
+
+    worker_id = f"beam_vllm_d{depth}{worker_suffix}"
+    cmd = [
+        args.python_bin,
+        "scripts/run_vllm_math_eq_combined_worker.py",
+        "--combined-results-file",
+        str(combined_results_file),
+        "--math-results-file",
+        str(math_results_file),
+        "--eq-results-file",
+        str(eq_results_file),
+        "--model",
+        args.model_path,
+        "--math-dataset-path",
+        args.math_dataset_path,
+        "--eq-dataset-path",
+        args.eq_dataset_path,
+        "--math-max-new",
+        str(args.math_max_new),
+        "--eq-max-new",
+        str(args.eq_max_new),
+        "--tensor-parallel-size",
+        str(args.vllm_tensor_parallel_size),
+        "--gpu-memory-utilization",
+        str(args.vllm_gpu_memory_utilization),
+        "--worker-extension-cls",
+        args.vllm_worker_extension_cls,
+        "--worker-id",
+        worker_id,
+    ]
+    if config_file is not None:
+        cmd.extend(["--config-file", str(config_file)])
+    if queue_file is not None:
+        cmd.extend(["--queue-file", str(queue_file)])
+    if args.skip_worker_preflight:
+        cmd.append("--skip-preflight")
+    if args.trust_remote_code:
+        cmd.append("--trust-remote-code")
+    else:
+        cmd.append("--no-trust-remote-code")
+    if args.vllm_enforce_eager:
+        cmd.append("--enforce-eager")
+    else:
+        cmd.append("--no-enforce-eager")
+    if args.vllm_max_model_len is not None:
+        cmd.extend(["--max-model-len", str(args.vllm_max_model_len)])
+    if args.vllm_max_num_seqs is not None:
+        cmd.extend(["--max-num-seqs", str(args.vllm_max_num_seqs)])
+    if args.vllm_max_num_batched_tokens is not None:
+        cmd.extend(["--max-num-batched-tokens", str(args.vllm_max_num_batched_tokens)])
+    if args.vllm_block_size is not None:
+        cmd.extend(["--block-size", str(args.vllm_block_size)])
+    if args.vllm_reasoning_parser:
+        cmd.extend(["--reasoning-parser", args.vllm_reasoning_parser])
+    if args.vllm_mm_encoder_tp_mode:
+        cmd.extend(["--mm-encoder-tp-mode", args.vllm_mm_encoder_tp_mode])
+    if idle_timeout_sec is not None:
+        cmd.extend(["--idle-timeout-sec", str(idle_timeout_sec)])
+    if queue_poll_interval_sec is not None:
+        cmd.extend(["--queue-poll-interval-sec", str(queue_poll_interval_sec)])
+    if stop_file is not None:
+        cmd.extend(["--stop-file", str(stop_file)])
+    return cmd
+
+
 def write_queue_file(path: Path, entries: list[dict[str, Any]]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", encoding="utf-8") as f:
         json.dump(entries, f)
+
+
+def append_queue_file(path: Path, entries: list[dict[str, Any]]) -> None:
+    if not entries:
+        return
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a+", encoding="utf-8") as f:
+        fcntl.flock(f, fcntl.LOCK_EX)
+        try:
+            f.seek(0)
+            raw = f.read().strip()
+            queue = json.loads(raw) if raw else []
+            if not isinstance(queue, list):
+                raise ValueError(f"Queue file does not contain a list: {path}")
+            queue.extend(entries)
+            f.seek(0)
+            f.truncate()
+            json.dump(queue, f)
+        finally:
+            fcntl.flock(f, fcntl.LOCK_UN)
 
 
 def queue_remaining_count(path: Path) -> int:
@@ -893,6 +1152,55 @@ def queue_remaining_count(path: Path) -> int:
     except Exception:
         pass
     return 0
+
+
+def load_layer_score_map_lenient(path: Path) -> dict[tuple[int, ...], float]:
+    for attempt in range(5):
+        try:
+            return load_layer_score_map(path)
+        except (EOFError, pickle.UnpicklingError, OSError):
+            if attempt == 4:
+                return {}
+            time.sleep(0.1)
+    return {}
+
+
+def wait_for_vllm_candidate_scores(
+    *,
+    candidates: list[dict[str, Any]],
+    math_results_file: Path,
+    eq_results_file: Path,
+    queue_file: Path,
+    worker: StreamingProcess,
+    depth: int,
+    poll_interval: float,
+    status_interval: float,
+) -> tuple[dict[tuple[int, ...], float], dict[tuple[int, ...], float]]:
+    required = {tuple(c["layer_key"]) for c in candidates}
+    last_status = 0.0
+    while True:
+        math_scores = load_layer_score_map_lenient(math_results_file)
+        eq_scores = load_layer_score_map_lenient(eq_results_file)
+        complete = required & set(math_scores) & set(eq_scores)
+        if len(complete) == len(required):
+            return math_scores, eq_scores
+
+        rc = worker.poll()
+        missing = len(required) - len(complete)
+        if rc is not None:
+            raise RuntimeError(
+                f"Persistent vLLM worker exited with code {rc} while depth {depth} "
+                f"still had {missing}/{len(required)} missing scores. See log: {worker.log_path}"
+            )
+
+        now = time.time()
+        if now - last_status >= status_interval:
+            print(
+                f"Depth {depth} vLLM wait: complete={len(complete)}/{len(required)} "
+                f"missing={missing} queued={queue_remaining_count(queue_file)}"
+            )
+            last_status = now
+        time.sleep(max(poll_interval, 0.1))
 
 
 def run_depth_workers_dynamic(
@@ -1055,6 +1363,7 @@ def run_depth_workers_dynamic(
 
 
 def main() -> None:
+    enable_line_buffered_output()
     args = parse_args()
 
     if args.max_depth < 1:
@@ -1085,6 +1394,10 @@ def main() -> None:
         raise ValueError("--monitor-interval-sec must be >= 1")
     if args.overhead_penalty_lambda < 0:
         raise ValueError("--overhead-penalty-lambda must be >= 0")
+    if args.vllm_persistent_idle_timeout_sec < 1:
+        raise ValueError("--vllm-persistent-idle-timeout-sec must be >= 1")
+    if args.vllm_queue_poll_interval_sec <= 0:
+        raise ValueError("--vllm-queue-poll-interval-sec must be > 0")
 
     validate_arbitrary_layer_scheme()
     print("Arbitrary layer expansion validation: OK")
@@ -1102,8 +1415,8 @@ def main() -> None:
             f"eq={seed_eq_path} exists={seed_eq_path.exists()}"
         )
 
-    seed_math = load_pair_score_map(seed_math_path)
-    seed_eq = load_pair_score_map(seed_eq_path)
+    seed_math = load_pair_score_map(seed_math_path, num_layers=args.num_layers)
+    seed_eq = load_pair_score_map(seed_eq_path, num_layers=args.num_layers)
     print(
         f"Loaded seed results: math={len(seed_math)} keys, eq={len(seed_eq)} keys, "
         f"common={len(set(seed_math) & set(seed_eq))}"
@@ -1161,28 +1474,45 @@ def main() -> None:
 
         if needs_seed_run:
             print(f"Running seed-rescore pass from {seed_rescore_config_path}")
-            math_cmd = build_math_worker_cmd(
-                args=args,
-                config_file=seed_rescore_config_path,
-                queue_file=None,
-                results_file=seed_rescore_math_path,
-                depth=0,
-            )
-            eq_cmd = build_eq_worker_cmd(
-                args=args,
-                config_file=seed_rescore_config_path,
-                queue_file=None,
-                results_file=seed_rescore_eq_path,
-                depth=0,
-            )
-            run_workers_parallel(
-                runs=[
-                    (math_cmd, work_dir / "beam_math_worker.log"),
-                    (eq_cmd, work_dir / "beam_eq_worker.log"),
-                ],
-                cwd=ROOT,
-                dry_run=args.dry_run,
-            )
+            if args.worker_backend == "vllm":
+                vllm_cmd = build_vllm_combined_worker_cmd(
+                    args=args,
+                    config_file=seed_rescore_config_path,
+                    queue_file=None,
+                    combined_results_file=work_dir / "seed_rescore_combined.pkl",
+                    math_results_file=seed_rescore_math_path,
+                    eq_results_file=seed_rescore_eq_path,
+                    depth=0,
+                )
+                run_worker(
+                    cmd=vllm_cmd,
+                    cwd=ROOT,
+                    log_path=work_dir / "beam_vllm_worker.log",
+                    dry_run=args.dry_run,
+                )
+            else:
+                math_cmd = build_math_worker_cmd(
+                    args=args,
+                    config_file=seed_rescore_config_path,
+                    queue_file=None,
+                    results_file=seed_rescore_math_path,
+                    depth=0,
+                )
+                eq_cmd = build_eq_worker_cmd(
+                    args=args,
+                    config_file=seed_rescore_config_path,
+                    queue_file=None,
+                    results_file=seed_rescore_eq_path,
+                    depth=0,
+                )
+                run_workers_parallel(
+                    runs=[
+                        (math_cmd, work_dir / "beam_math_worker.log"),
+                        (eq_cmd, work_dir / "beam_eq_worker.log"),
+                    ],
+                    cwd=ROOT,
+                    dry_run=args.dry_run,
+                )
         else:
             print(
                 "Seed-rescore reuse enabled; using existing files: "
@@ -1315,6 +1645,16 @@ def main() -> None:
     completed_depths: list[int] = []
     stop_reason = "max_depth_reached"
     beam_started_at = time.time()
+    persistent_vllm_worker: StreamingProcess | None = None
+    persistent_vllm_queue_file = work_dir / "beam_vllm_persistent_queue.json"
+    persistent_vllm_stop_file = work_dir / "beam_vllm_persistent.stop"
+    persistent_vllm_combined_results_path = work_dir / "beam_vllm_combined_results.pkl"
+    if args.worker_backend == "vllm" and args.vllm_persistent_worker and not args.dry_run:
+        write_queue_file(persistent_vllm_queue_file, [])
+        try:
+            persistent_vllm_stop_file.unlink()
+        except FileNotFoundError:
+            pass
 
     # Beam expansion for depth >= 2
     for depth in range(args.start_depth, args.max_depth + 1):
@@ -1478,7 +1818,83 @@ def main() -> None:
             f"eq_missing={len(eq_queue_entries)}"
         )
 
-        if args.dynamic_split:
+        if args.worker_backend == "vllm":
+            combined_queue_entries: list[dict[str, Any]] = []
+            for idx, c in enumerate(candidates):
+                if c["layer_key"] in existing_math_scores and c["layer_key"] in existing_eq_scores:
+                    continue
+                combined_queue_entries.append(
+                    {
+                        "idx": idx,
+                        "spec": blocks_to_spec(c["blocks"]),
+                        "layers": list(c["layer_key"]),
+                    }
+                )
+            combined_queue_file = (
+                persistent_vllm_queue_file
+                if args.vllm_persistent_worker
+                else work_dir / f"depth_{depth}_vllm_queue.json"
+            )
+            combined_results_file = (
+                persistent_vllm_combined_results_path
+                if args.vllm_persistent_worker
+                else work_dir / f"depth_{depth}_vllm_combined_results.pkl"
+            )
+            if args.vllm_persistent_worker:
+                append_queue_file(combined_queue_file, combined_queue_entries)
+            else:
+                write_queue_file(combined_queue_file, combined_queue_entries)
+            print(f"Depth {depth} vLLM queue prep: missing_any={len(combined_queue_entries)}")
+            if combined_queue_entries:
+                if args.vllm_persistent_worker:
+                    if persistent_vllm_worker is None or persistent_vllm_worker.poll() is not None:
+                        vllm_cmd = build_vllm_combined_worker_cmd(
+                            args=args,
+                            config_file=None,
+                            queue_file=combined_queue_file,
+                            combined_results_file=combined_results_file,
+                            math_results_file=math_beam_results_path,
+                            eq_results_file=eq_beam_results_path,
+                            depth=depth,
+                            worker_suffix="_persistent",
+                            idle_timeout_sec=args.vllm_persistent_idle_timeout_sec,
+                            queue_poll_interval_sec=args.vllm_queue_poll_interval_sec,
+                            stop_file=persistent_vllm_stop_file,
+                        )
+                        print(" ".join(vllm_cmd))
+                        persistent_vllm_worker = StreamingProcess(
+                            cmd=vllm_cmd,
+                            cwd=ROOT,
+                            log_path=work_dir / "beam_vllm_worker.log",
+                        )
+                        persistent_vllm_worker.start()
+                    existing_math_scores, existing_eq_scores = wait_for_vllm_candidate_scores(
+                        candidates=candidates,
+                        math_results_file=math_beam_results_path,
+                        eq_results_file=eq_beam_results_path,
+                        queue_file=combined_queue_file,
+                        worker=persistent_vllm_worker,
+                        depth=depth,
+                        poll_interval=args.vllm_queue_poll_interval_sec,
+                        status_interval=float(args.monitor_interval_sec),
+                    )
+                else:
+                    vllm_cmd = build_vllm_combined_worker_cmd(
+                        args=args,
+                        config_file=None,
+                        queue_file=combined_queue_file,
+                        combined_results_file=combined_results_file,
+                        math_results_file=math_beam_results_path,
+                        eq_results_file=eq_beam_results_path,
+                        depth=depth,
+                    )
+                    run_worker(
+                        cmd=vllm_cmd,
+                        cwd=ROOT,
+                        log_path=work_dir / "beam_vllm_worker.log",
+                        dry_run=args.dry_run,
+                    )
+        elif args.dynamic_split:
             run_depth_workers_dynamic(
                 args=args,
                 depth=depth,
@@ -1653,6 +2069,22 @@ def main() -> None:
             )
             print(f"Stopping after depth {depth}: {stop_reason}")
             break
+
+    if persistent_vllm_worker is not None:
+        persistent_vllm_stop_file.write_text("stop\n", encoding="utf-8")
+        try:
+            rc = persistent_vllm_worker.wait(timeout=60)
+            if rc != 0:
+                raise RuntimeError(
+                    f"Persistent vLLM worker failed with code {rc}. "
+                    f"See log: {persistent_vllm_worker.log_path}"
+                )
+        except subprocess.TimeoutExpired:
+            persistent_vllm_worker.terminate()
+            raise RuntimeError(
+                "Persistent vLLM worker did not exit after stop signal. "
+                f"See log: {persistent_vllm_worker.log_path}"
+            )
 
     # Final overall summary
     use_final_ranking = args.overhead_penalty_lambda > 0
